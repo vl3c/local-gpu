@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  # Cancel superseded runs on PR updates only; every push to main runs to completion.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # No GPU and no model servers: the machine readings are faked in the tests.
+  # Windows, the platform the tool targets. The job name is the required status check.
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: unittest
+        run: python -m unittest discover tests -v
+      - name: gpu.py loads and parses its registry
+        run: python gpu.py --help
+      - name: Pre-publish safety scan (files and history)
+        run: |
+          git fetch --unshallow --quiet || true
+          python scripts/check_repo_safe.py --history

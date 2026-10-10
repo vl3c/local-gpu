@@ -1,0 +1,42 @@
+{
+  "_about": "The local AI servers that share one GPU. gpu.py reads this. Each folder (under skills_dir) has its own start.cmd and stop.cmd. health: GET path that answers 200 when ready (llama-server answers 503 while loading). busy: how to tell a job is in flight (health:<field>, comfy-queue or llama-slots). owner: path under the folder that the listening process's command line or executable must contain for the server to count as this install's (a worktree or another copy on the same port is not stopped through this stop.cmd). pid_file / pid_cmd: for servers that load their models before opening the port, the PID file they write at startup and a regex its command line must match. warmup_s: how long switch waits for health. typical: shown when the server is down. Your own servers, or field-by-field changes to these, go in servers.local.json (same shape, not tracked by git).",
+  "skills_dir": "~/.claude/skills",
+  "servers": {
+    "local-voice": {
+      "owner": "server/app.py",
+      "port": 8190,
+      "health": "/api/health",
+      "pid_file": "output/.server.pid",
+      "pid_cmd": "server.app\\.py",
+      "start_args": [
+        "--no-browser"
+      ],
+      "warmup_s": 240,
+      "typical": "8.4 GB English, 12.6 GB with Whisper and Romanian"
+    },
+    "local-sounds": {
+      "owner": "server/app.py",
+      "port": 8191,
+      "health": "/api/health",
+      "busy": "health:busy",
+      "pid_file": "output/.server.pid",
+      "pid_cmd": "server.app\\.py",
+      "start_args": [
+        "--no-browser"
+      ],
+      "warmup_s": 600,
+      "typical": "~4 GB SA3, ~14 GB peak with MOSS too"
+    },
+    "local-image": {
+      "owner": "ComfyUI/main.py",
+      "port": 8188,
+      "health": "/system_stats",
+      "busy": "comfy-queue",
+      "start_args": [
+        "--no-browser"
+      ],
+      "warmup_s": 180,
+      "typical": "small until the first image, then ~15.5 GB"
+    }
+  }
+}
