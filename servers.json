@@ -6,6 +6,7 @@
       "owner": "server/app.py",
       "port": 8190,
       "health": "/api/health",
+      "busy": "health:busy",
       "pid_file": "output/.server.pid",
       "pid_cmd": "server.app\\.py",
       "start_args": [
