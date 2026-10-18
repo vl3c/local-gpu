@@ -41,6 +41,9 @@ class Machine:
         self.health = {}  # port -> (status, json)
         self.extra = {}   # url suffix -> (status, json), e.g. "/queue"
         self.smi = {"name": "Test GPU", "used": 10 * GB, "total": 16 * GB}
+        self.shared = {}  # pid -> shared GPU memory; None: a query result from before it was read
+        self.completion = (200, {"timings": {"predicted_per_second": 71.3, "predicted_n": 128}})
+        self.posts = []
 
     def registry(self):
         return gpu.load_registry(self.root)
@@ -48,10 +51,22 @@ class Machine:
     def folder(self, name):
         return str(self.skills / name)
 
-    def proc(self, pid, cmd, ppid=1, start=1000, name="python.exe", vram=0.0):
+    def proc(self, pid, cmd, ppid=1, start=1000, name="python.exe", vram=0.0, shared=0.0):
         self.procs.append({"pid": pid, "ppid": ppid, "name": name, "start": start, "cmd": cmd, "exe": None})
         if vram:
             self.gpu[pid] = vram * GB
+        if shared:
+            self.shared[pid] = shared * GB
+
+    def http_post_json(self, url, data, timeout=120):
+        self.posts.append((url, data))
+        return self.completion
+
+    def query(self, ports):
+        result = {"listen": self.listen, "procs": self.procs, "gpu": self.gpu}
+        if self.shared is not None:
+            result["shared"] = self.shared
+        return result
 
     def http_get(self, url, timeout=3):
         for port, answer in self.health.items():
@@ -63,10 +78,10 @@ class Machine:
         return None, None
 
     def patches(self):
-        return [mock.patch.object(gpu, "query_windows", lambda ports: {
-                    "listen": self.listen, "procs": self.procs, "gpu": self.gpu}),
+        return [mock.patch.object(gpu, "query_windows", self.query),
                 mock.patch.object(gpu, "nvidia_smi", lambda: self.smi),
-                mock.patch.object(gpu, "http_get", self.http_get)]
+                mock.patch.object(gpu, "http_get", self.http_get),
+                mock.patch.object(gpu, "http_post_json", self.http_post_json)]
 
     def snapshot(self):
         with ExitStack() as stack:
@@ -351,6 +366,138 @@ class FormatTest(unittest.TestCase):
         self.assertEqual(gpu.ago(45), "45s")
         self.assertEqual(gpu.ago(125), "2m")
         self.assertEqual(gpu.ago(3 * 3600 + 5 * 60), "3h 05m")
+
+
+LLAMA = {"owner": "models/", "port": 8080, "hosts": ["127.0.0.1", "127.0.0.2"], "health": "/health",
+         "busy": "llama-slots", "start_args": ["--no-browser"], "warmup_s": 60, "typical": "14 GB"}
+
+
+class CheckTest(unittest.TestCase):
+    """`check` runs through the real snapshot(): only the machine readings are faked."""
+
+    def setUp(self):
+        self.m = Machine({"local-agent": LLAMA, "local-image": IMAGE})
+
+    def llama_up(self, shared=(0.2, 0.1), addr="127.0.0.2", busy=False, vram=(1.0, 12.0)):
+        # The server process and its child; dedicated and shared memory are summed over both.
+        self.m.listen.append({"addr": addr, "port": 8080, "pid": 50})
+        self.m.proc(50, f"{self.m.folder('local-agent')}\\models\\bin\\llama-server.exe --port 8080",
+                    name="llama-server.exe", vram=vram[0], shared=shared[0])
+        self.m.proc(51, "helper", ppid=50, start=1001, vram=vram[1], shared=shared[1])
+        self.m.health[8080] = (200, {"status": "ok"})
+        self.m.extra["/slots"] = (200, [{"is_processing": busy}])
+
+    def check(self, name="local-agent", reg=None, **kw):
+        with ExitStack() as stack:
+            for p in self.m.patches():
+                stack.enter_context(p)
+            with redirect_stdout(io.StringIO()) as out:
+                code = gpu.cmd_check(args(name=name, speed=kw.get("speed", False), json=kw.get("json", False)),
+                                     reg or self.m.registry())
+        return code, out.getvalue()
+
+    def test_no_spill_sums_the_process_tree(self):
+        self.llama_up()
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("local-agent: up (pid 50), 13.0 GB dedicated, 0.3 GB shared - no spill", out)
+        self.assertIn("card: 6.0 GB of 16.0 GB free", out)
+        self.assertEqual(self.m.posts, [])  # no --speed: nothing is sent to the server
+
+    def test_spill_fails_and_says_what_to_do(self):
+        self.llama_up(shared=(2.5, 0.5))
+        code, out = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("3.0 GB shared - SPILLING", out)
+        self.assertIn("several times slower", out)
+        self.assertIn("gpu.py status", out)
+
+    def test_just_under_the_spill_line_is_fine(self):
+        self.llama_up(shared=(0.9, 0.0))
+        self.assertEqual(self.check()[0], 0)
+
+    def test_speed_is_measured_on_the_host_that_answered(self):
+        self.llama_up(addr="127.0.0.2")
+        code, out = self.check(speed=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("speed: 71.3 tok/s (128 tokens)", out)
+        self.assertEqual(self.m.posts, [("http://127.0.0.2:8080/completion", gpu.SPEED_REQUEST)])
+
+    def test_a_min_tok_s_floor_fails_a_slow_server(self):
+        self.llama_up()
+        reg = self.m.registry()
+        reg["local-agent"]["min_tok_s"] = 80
+        code, out = self.check(reg=reg, speed=True)
+        self.assertEqual(code, 1)
+        self.assertIn("BELOW the expected 80 tok/s", out)
+        reg["local-agent"]["min_tok_s"] = 60
+        self.assertEqual(self.check(reg=reg, speed=True)[0], 0)
+
+    def test_a_busy_server_is_not_measured(self):
+        self.llama_up(busy=True)
+        code, out = self.check(speed=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("speed: not measured (busy with another request)", out)
+        self.assertEqual(self.m.posts, [])
+
+    def test_a_failed_speed_request_is_reported_not_fatal(self):
+        self.llama_up()
+        self.m.completion = (500, None)
+        code, out = self.check(speed=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("speed: not measured (the request failed: 500)", out)
+
+    def test_speed_only_for_llama_servers(self):
+        self.m.listen.append({"addr": "127.0.0.1", "port": 8188, "pid": 60})
+        self.m.proc(60, f"py {self.m.folder('local-image')}\\ComfyUI\\main.py", vram=9.0)
+        self.m.health[8188] = (200, {})
+        self.m.extra["/queue"] = (200, {"queue_running": [], "queue_pending": []})
+        code, out = self.check("local-image", speed=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("speed: not measured (not a llama.cpp server)", out)
+        self.assertEqual(self.m.posts, [])
+
+    def test_a_server_that_is_down_fails(self):
+        code, out = self.check(speed=True)
+        self.assertEqual(code, 1)
+        self.assertIn("local-agent: not running (down).", out)
+        self.assertEqual(self.m.posts, [])
+
+    def test_an_older_query_result_without_shared_counters(self):
+        self.m.shared = None
+        self.llama_up(shared=(0, 0))
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("0.0 GB shared - no spill", out)  # an empty map: nothing shared
+
+    def test_no_gpu_counters_does_not_crash(self):
+        self.llama_up(shared=(0, 0), vram=(0, 0))
+        code, out = self.check(json=True)
+        data = json.loads(out)
+        self.assertEqual((code, data["dedicated_bytes"], data["shared_bytes"], data["spilling"]), (0, None, None, False))
+        code, out = self.check()
+        self.assertIn("? dedicated, ? shared - spill unknown (no GPU counters)", out)
+
+    def test_json_result(self):
+        self.llama_up(shared=(3.0, 0.0))
+        code, out = self.check(speed=True, json=True)
+        data = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual({k: data[k] for k in ("name", "state", "running", "pid", "spilling", "tok_s", "tokens", "ok")},
+                         {"name": "local-agent", "state": "up", "running": True, "pid": 50, "spilling": True,
+                          "tok_s": 71.3, "tokens": 128, "ok": False})
+        self.assertEqual(data["shared_bytes"], 3 * GB)
+        self.assertEqual(data["card_free_bytes"], 6 * GB)
+
+    def test_the_command_is_wired_read_only(self):
+        seen, reg = {}, self.m.registry()
+        with mock.patch.object(gpu, "load_registry", lambda *a: reg), \
+                mock.patch.object(gpu, "cmd_check", lambda a, s: seen.update(vars(a)) or 3), \
+                mock.patch("sys.argv", ["gpu.py", "check", "local-agent", "--speed", "--json"]):
+            self.assertEqual(gpu.main(), 3)
+        self.assertEqual((seen["name"], seen["speed"], seen["json"]), ("local-agent", True, True))
+        self.assertNotIn("yes", seen)  # nothing to confirm: check never stops or starts anything
+        self.assertNotIn("force", seen)
 
 
 if __name__ == "__main__":

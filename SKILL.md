@@ -62,6 +62,19 @@ that covers those switches; anything else still gets its own question.
 `--json` gives the same as JSON. Arguments after the name go to that tool's start.cmd;
 options that begin with `--` go after `--`: `switch local-voice --yes -- --safe`.
 
+## Before a long job: `check`
+
+```bash
+python "<base dir>/gpu.py" check <name> [--speed] [--json]
+```
+
+Read-only. It answers whether the server is up and holds its model in dedicated VRAM. Exit 1
+means down, not ready, or **spilling**: 1 GB or more of its memory sits in shared system RAM,
+so everything runs several times slower. Then tell the user and find what else holds the GPU
+with `status`; never start a long job on a spilling server. `--speed` (llama.cpp servers
+only, skipped while one is busy) times a 128-token completion and reports tok/s; with a
+`min_tok_s` in the registry, slower fails too. A measurement takes a few seconds of GPU time.
+
 ## Rules
 
 - Servers are stopped only through their own stop.cmd (`gpu.py` does this), never by
