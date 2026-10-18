@@ -17,8 +17,9 @@ has agreed.
 Per-process VRAM: nvidia-smi reports [N/A] for it on Windows (WDDM), so each server's
 figure is the "GPU Process Memory / Dedicated Usage" performance counter summed over the
 process listening on its port and that process's children. Only the card total comes
-from nvidia-smi. `check` reads the "Shared Usage" counter the same way: a model that does
-not fit in VRAM spills into shared (system) memory and runs several times slower.
+from nvidia-smi. `check` also reads "Shared Usage" and "Total Committed": when the card is
+oversubscribed Windows evicts part of a model from VRAM into system RAM (committed but neither
+dedicated nor shared), and everything on the card runs several times slower.
 Standard library only.
 """
 import argparse
@@ -41,7 +42,7 @@ GB = 2**30
 OTHER_MIN = 0.5 * GB      # other GPU programs below this are not worth listing
 IGNORE = {"dwm.exe"}      # its Dedicated Usage counter is meaningless (larger than the card)
 STOP_WAIT = 20            # seconds for a server to be gone after its stop.cmd
-SPILL_MIN = 1 * GB        # shared usage from here up is a spill; a few hundred MB is driver overhead
+SPILL_MIN = 1 * GB        # shared + evicted from here up is a spill; a few hundred MB is driver overhead
 SPEED_REQUEST = {"prompt": "Count from 1 to 200, separated by spaces:", "n_predict": 128,
                  "temperature": 0, "cache_prompt": False}
 
@@ -97,7 +98,10 @@ $gpu = @{}
 $shared = @{}
 (Get-Counter '\GPU Process Memory(*)\Shared Usage').CounterSamples | ForEach-Object {
   if ($_.InstanceName -match '^pid_(\d+)_') { $shared[$matches[1]] = [double]$shared[$matches[1]] + $_.CookedValue } }
-@{ listen = $listen; procs = $procs; gpu = $gpu; shared = $shared } | ConvertTo-Json -Depth 4 -Compress
+$committed = @{}
+(Get-Counter '\GPU Process Memory(*)\Total Committed').CounterSamples | ForEach-Object {
+  if ($_.InstanceName -match '^pid_(\d+)_') { $committed[$matches[1]] = [double]$committed[$matches[1]] + $_.CookedValue } }
+@{ listen = $listen; procs = $procs; gpu = $gpu; shared = $shared; committed = $committed } | ConvertTo-Json -Depth 4 -Compress
 """
 
 
@@ -110,7 +114,8 @@ def query_windows(ports) -> dict:
     as_list = lambda v: v if isinstance(v, list) else ([v] if v else [])  # noqa: E731
     return {"listen": as_list(data.get("listen")), "procs": as_list(data.get("procs")),
             "gpu": {int(k): v for k, v in (data.get("gpu") or {}).items()},
-            "shared": {int(k): v for k, v in (data.get("shared") or {}).items()}}
+            "shared": {int(k): v for k, v in (data.get("shared") or {}).items()},
+            "committed": {int(k): v for k, v in (data.get("committed") or {}).items()}}
 
 
 def nvidia_smi() -> dict | None:
@@ -216,7 +221,7 @@ def snapshot(servers: dict) -> dict:
     now, gpu_ok, owned, rows = time.time(), bool(win["gpu"]), set(), {}
     for name, s in servers.items():
         row = {"name": name, "state": "down", "pid": None, "host": None, "vram": None,
-               "shared": None, "uptime_s": None, "busy": None, "other": None}
+               "shared": None, "evicted": None, "uptime_s": None, "busy": None, "other": None}
         hosts = s.get("hosts", ["127.0.0.1"])
         mine = [x for x in win["listen"] if x["port"] == s["port"]]
         if mine and not owns(s, procs.get(mine[0]["pid"])):
@@ -249,6 +254,8 @@ def snapshot(servers: dict) -> dict:
                 row["vram"] = sum(win["gpu"].get(x, 0) for x in pids)
                 shared = win.get("shared") or {}  # an older query result has no shared counters
                 row["shared"] = sum(shared.get(x, 0) for x in pids)
+                if win.get("committed"):
+                    row["evicted"] = sum(evicted(win, x) for x in pids)
             if procs.get(row["pid"], {}).get("start"):
                 row["uptime_s"] = int(now - procs[row["pid"]]["start"])
         rows[name] = row
@@ -257,7 +264,20 @@ def snapshot(servers: dict) -> dict:
               for pid, b in win["gpu"].items()
               if b >= OTHER_MIN and pid not in owned and procs.get(pid, {}).get("name") not in IGNORE]
     others.sort(key=lambda o: -o["vram"])
-    return {"gpu": nvidia_smi(), "gpu_counter_ok": gpu_ok, "servers": rows, "others": others}
+    # Programs (not this server) with memory evicted from VRAM: the card is oversubscribed, and
+    # whichever of them runs pushes the others' memory out again.
+    paged = [{"pid": pid, "name": procs.get(pid, {}).get("name", "?"), "evicted": evicted(win, pid)}
+             for pid in (win.get("committed") or {})
+             if pid not in owned and procs.get(pid, {}).get("name") not in IGNORE and evicted(win, pid) >= SPILL_MIN]
+    paged.sort(key=lambda o: -o["evicted"])
+    return {"gpu": nvidia_smi(), "gpu_counter_ok": gpu_ok, "servers": rows, "others": others, "paged_out": paged}
+
+
+def evicted(win: dict, pid: int) -> float:
+    """A process's GPU memory that is committed but neither in VRAM nor in shared memory:
+    Windows evicted it to system RAM because the card is oversubscribed."""
+    committed = (win.get("committed") or {}).get(pid, 0)
+    return max(0.0, committed - win["gpu"].get(pid, 0) - (win.get("shared") or {}).get(pid, 0))
 
 
 def gb(b) -> str:
@@ -511,9 +531,12 @@ def measure_speed(s: dict, row: dict) -> tuple[float | None, int | None, str]:
 
 def check_result(name: str, s: dict, snap: dict, speed: bool) -> dict:
     r, card = snap["servers"][name], snap["gpu"]
+    out_of_vram = None if r["shared"] is None else r["shared"] + (r.get("evicted") or 0)
+    paged = snap.get("paged_out") or []
     result = {"name": name, "state": r["state"], "running": running(r), "pid": r["pid"],
-              "dedicated_bytes": r["vram"], "shared_bytes": r["shared"],
-              "spilling": r["shared"] is not None and r["shared"] >= SPILL_MIN,
+              "dedicated_bytes": r["vram"], "shared_bytes": r["shared"], "evicted_bytes": r.get("evicted"),
+              "spilling": out_of_vram is not None and out_of_vram >= SPILL_MIN,
+              "contended": bool(paged) and running(r), "paged_out": paged,
               "card_free_bytes": card["total"] - card["used"] if card else None,
               "tok_s": None, "tokens": None, "min_tok_s": s.get("min_tok_s"),
               "speed_note": "not requested"}
@@ -521,7 +544,7 @@ def check_result(name: str, s: dict, snap: dict, speed: bool) -> dict:
         result["tok_s"], result["tokens"], result["speed_note"] = measure_speed(s, r)
     too_slow = result["tok_s"] is not None and result["min_tok_s"] is not None and result["tok_s"] < result["min_tok_s"]
     result["too_slow"] = too_slow
-    result["ok"] = r["state"] == "up" and not result["spilling"] and not too_slow
+    result["ok"] = r["state"] == "up" and not result["spilling"] and not result["contended"] and not too_slow
     return result
 
 
@@ -539,7 +562,8 @@ def cmd_check(args, servers):
         print(f"{args.name}: not running ({r['state']})."
               + (" " + foreign_note(args.name, s, r) if r["state"] == "other install" else ""))
         return 1
-    memory = f"{gb(res['dedicated_bytes'])} dedicated, {gb(res['shared_bytes'])} shared"
+    memory = f"{gb(res['dedicated_bytes'])} dedicated, {gb(res['shared_bytes'])} shared" + (
+        f", {gb(res['evicted_bytes'])} evicted" if res["evicted_bytes"] else "")
     if res["spilling"]:
         print(f"{args.name}: {r['state']} (pid {r['pid']}), {memory} - SPILLING: part of the model is in "
               f"system RAM, so it runs several times slower. Free VRAM (`gpu.py status` shows what holds it) "
@@ -547,6 +571,11 @@ def cmd_check(args, servers):
     else:
         print(f"{args.name}: {r['state']} (pid {r['pid']}), {memory} - "
               + ("no spill" if res["shared_bytes"] is not None else "spill unknown (no GPU counters)"))
+    if res["contended"]:
+        print("CONTENDED: the card is oversubscribed. These programs have GPU memory paged out to system RAM: "
+              + ", ".join(f"{p['name']} (pid {p['pid']}) {gb(p['evicted'])}" for p in res["paged_out"])
+              + ". Whenever one of them runs, the others' memory is pushed out and both run several times "
+              "slower. Close it, or stop it with gpu.py if it is a registered server.")
     g = snap["gpu"]
     if g:
         print(f"card: {gb(res['card_free_bytes'])} of {gb(g['total'])} free")

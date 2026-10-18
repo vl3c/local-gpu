@@ -69,9 +69,11 @@ python "<base dir>/gpu.py" check <name> [--speed] [--json]
 ```
 
 Read-only. It answers whether the server is up and holds its model in dedicated VRAM. Exit 1
-means down, not ready, or **spilling**: 1 GB or more of its memory sits in shared system RAM,
-so everything runs several times slower. Then tell the user and find what else holds the GPU
-with `status`; never start a long job on a spilling server. `--speed` (llama.cpp servers
+means down, not ready, **spilling** (1 GB or more of its memory is outside VRAM: in shared
+memory, or evicted to system RAM) or **contended** (another program has memory evicted: the
+card is oversubscribed, and whichever runs pushes the other out; two models generating at
+once fell from 70 to 7 tok/s). Then tell the user and find what else holds the GPU with
+`status`; never start a long job on a spilling or contended server. `--speed` (llama.cpp servers
 only, skipped while one is busy) times a 128-token completion and reports tok/s; with a
 `min_tok_s` in the registry, slower fails too. A measurement takes a few seconds of GPU time.
 
