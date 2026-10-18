@@ -42,6 +42,7 @@ class Machine:
         self.extra = {}   # url suffix -> (status, json), e.g. "/queue"
         self.smi = {"name": "Test GPU", "used": 10 * GB, "total": 16 * GB}
         self.shared = {}  # pid -> shared GPU memory; None: a query result from before it was read
+        self.committed = {}  # pid -> total committed GPU memory (empty: not read)
         self.completion = (200, {"timings": {"predicted_per_second": 71.3, "predicted_n": 128}})
         self.posts = []
 
@@ -51,12 +52,14 @@ class Machine:
     def folder(self, name):
         return str(self.skills / name)
 
-    def proc(self, pid, cmd, ppid=1, start=1000, name="python.exe", vram=0.0, shared=0.0):
+    def proc(self, pid, cmd, ppid=1, start=1000, name="python.exe", vram=0.0, shared=0.0, committed=0.0):
         self.procs.append({"pid": pid, "ppid": ppid, "name": name, "start": start, "cmd": cmd, "exe": None})
         if vram:
             self.gpu[pid] = vram * GB
         if shared:
             self.shared[pid] = shared * GB
+        if committed:
+            self.committed[pid] = committed * GB
 
     def http_post_json(self, url, data, timeout=120):
         self.posts.append((url, data))
@@ -66,6 +69,8 @@ class Machine:
         result = {"listen": self.listen, "procs": self.procs, "gpu": self.gpu}
         if self.shared is not None:
             result["shared"] = self.shared
+        if self.committed:
+            result["committed"] = self.committed
         return result
 
     def http_get(self, url, timeout=3):
@@ -378,12 +383,12 @@ class CheckTest(unittest.TestCase):
     def setUp(self):
         self.m = Machine({"local-agent": LLAMA, "local-image": IMAGE})
 
-    def llama_up(self, shared=(0.2, 0.1), addr="127.0.0.2", busy=False, vram=(1.0, 12.0)):
+    def llama_up(self, shared=(0.2, 0.1), addr="127.0.0.2", busy=False, vram=(1.0, 12.0), committed=(0.0, 0.0)):
         # The server process and its child; dedicated and shared memory are summed over both.
         self.m.listen.append({"addr": addr, "port": 8080, "pid": 50})
         self.m.proc(50, f"{self.m.folder('local-agent')}\\models\\bin\\llama-server.exe --port 8080",
-                    name="llama-server.exe", vram=vram[0], shared=shared[0])
-        self.m.proc(51, "helper", ppid=50, start=1001, vram=vram[1], shared=shared[1])
+                    name="llama-server.exe", vram=vram[0], shared=shared[0], committed=committed[0])
+        self.m.proc(51, "helper", ppid=50, start=1001, vram=vram[1], shared=shared[1], committed=committed[1])
         self.m.health[8080] = (200, {"status": "ok"})
         self.m.extra["/slots"] = (200, [{"is_processing": busy}])
 
@@ -498,6 +503,38 @@ class CheckTest(unittest.TestCase):
                           "tok_s": 71.3, "tokens": 128, "ok": False})
         self.assertEqual(data["shared_bytes"], 3 * GB)
         self.assertEqual(data["card_free_bytes"], 6 * GB)
+
+    def test_memory_evicted_from_vram_is_a_spill_too(self):
+        # Seen live: two models on one card. Windows evicts part of one to system RAM; it shows in
+        # neither Dedicated nor Shared Usage, only as committed memory that is missing from both.
+        self.llama_up(vram=(0.5, 3.75), shared=(0.0, 0.0), committed=(0.5, 13.0))
+        code, out = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("4.2 GB dedicated, 0.0 GB shared, 9.2 GB evicted - SPILLING", out)
+
+    def test_fully_resident_memory_is_not_evicted(self):
+        self.llama_up(committed=(1.2, 12.1))  # committed = dedicated + shared
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("evicted", out)
+
+    def test_another_program_paged_out_means_contention(self):
+        self.llama_up(committed=(1.2, 12.1))
+        self.m.proc(70, None, name="llama-server.exe", vram=1.3, shared=0.1, committed=10.2)  # a second model
+        self.m.proc(71, None, name="dwm.exe", vram=0.1, committed=30.0)  # its counters are meaningless
+        code, out = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("no spill", out)  # this server is resident right now...
+        self.assertIn("CONTENDED", out)  # ...but the card is oversubscribed
+        self.assertIn("llama-server.exe (pid 70) 8.8 GB", out)
+        self.assertNotIn("dwm.exe", out)
+        data = json.loads(self.check(json=True)[1])
+        self.assertEqual((data["contended"], data["spilling"], data["ok"]), (True, False, False))
+        self.assertEqual([p["pid"] for p in data["paged_out"]], [70])
+
+    def test_the_servers_own_children_are_not_contention(self):
+        self.llama_up(vram=(1.0, 12.0), committed=(1.2, 12.2))  # 0.1 GB below the 1 GB line
+        self.assertEqual(self.check()[0], 0)
 
     def test_the_command_is_wired_read_only(self):
         seen, reg = {}, self.m.registry()
