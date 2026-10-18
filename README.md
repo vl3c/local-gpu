@@ -33,6 +33,7 @@ other GPU programs: firefox.exe (29916) 0.7 GB
 | `gpu.py status [--json]` | Card total from nvidia-smi; per server: state, VRAM, PID, uptime, busy/idle; other programs holding over 0.5 GB. Read-only. |
 | `gpu.py switch <name> [args...]` | Lists what would be stopped and how much VRAM that frees, refuses if one of them is mid-job, asks, stops them through their own `stop.cmd`, checks the port closed and VRAM came back, starts the target with `start.cmd --no-browser [args]`, waits until it answers. |
 | `gpu.py stop <name>\|all` | The same, without starting anything. |
+| `gpu.py check <name> [--speed] [--json]` | Is the server up and holding its model in dedicated VRAM? Exit 1 when it is down, not ready yet, or **spilling** (1 GB or more of its memory in shared system RAM, from the `GPU Process Memory / Shared Usage` counter: it then runs several times slower). `--speed` times a 128-token completion on llama.cpp servers (never while busy) and also fails below the server's `min_tok_s`. Read-only. |
 
 Options: `--yes` (the user already confirmed), `--force` (stop a server even while it runs a
 job), `--timeout S` (how long `switch` waits for the target). Arguments after the name go to
@@ -121,6 +122,7 @@ entries are merged field by field:
 | `start_args` | Passed to `start.cmd`. |
 | `warmup_s` | How long `switch` waits for health. |
 | `typical` | Shown by `status` while the server is down. |
+| `min_tok_s` | Optional: `check --speed` fails when the measured speed is below this (tokens/s). |
 | `folder` | Folder name under `skills_dir`, if it isn't the server's name. |
 
 ### What a server must provide

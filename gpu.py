@@ -4,6 +4,7 @@
   gpu.py status [--json]
   gpu.py switch <name> [start args...] [--yes] [--force] [--timeout S]
   gpu.py stop <name>|all [--yes] [--force]
+  gpu.py check <name> [--speed] [--json]
 
 The servers are listed in servers.json, plus servers.local.json if it exists (not tracked
 by git: your own servers, or changes to the shared entries, field by field). Each one is
@@ -16,7 +17,9 @@ has agreed.
 Per-process VRAM: nvidia-smi reports [N/A] for it on Windows (WDDM), so each server's
 figure is the "GPU Process Memory / Dedicated Usage" performance counter summed over the
 process listening on its port and that process's children. Only the card total comes
-from nvidia-smi. Standard library only.
+from nvidia-smi. `check` reads the "Shared Usage" counter the same way: a model that does
+not fit in VRAM spills into shared (system) memory and runs several times slower.
+Standard library only.
 """
 import argparse
 import base64
@@ -38,6 +41,9 @@ GB = 2**30
 OTHER_MIN = 0.5 * GB      # other GPU programs below this are not worth listing
 IGNORE = {"dwm.exe"}      # its Dedicated Usage counter is meaningless (larger than the card)
 STOP_WAIT = 20            # seconds for a server to be gone after its stop.cmd
+SPILL_MIN = 1 * GB        # shared usage from here up is a spill; a few hundred MB is driver overhead
+SPEED_REQUEST = {"prompt": "Count from 1 to 200, separated by spaces:", "n_predict": 128,
+                 "temperature": 0, "cache_prompt": False}
 
 
 def load_registry(here: Path = HERE) -> dict:
@@ -70,8 +76,8 @@ def owns(s: dict, proc: dict | None) -> bool:
 # ---------------------------------------------------------------- reading the machine
 
 # One PowerShell call: listening sockets on the servers' ports, every process (with parent
-# and start time), and per-process dedicated GPU memory. Numbers go out as JSON, so the
-# Windows locale's number format never matters.
+# and start time), and per-process dedicated and shared GPU memory. Numbers go out as JSON,
+# so the Windows locale's number format never matters.
 PS_QUERY = r"""
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 $ErrorActionPreference = 'SilentlyContinue'
@@ -88,7 +94,10 @@ $procs = @(Get-CimInstance Win32_Process | ForEach-Object {
 $gpu = @{}
 (Get-Counter '\GPU Process Memory(*)\Dedicated Usage').CounterSamples | ForEach-Object {
   if ($_.InstanceName -match '^pid_(\d+)_') { $gpu[$matches[1]] = [double]$gpu[$matches[1]] + $_.CookedValue } }
-@{ listen = $listen; procs = $procs; gpu = $gpu } | ConvertTo-Json -Depth 4 -Compress
+$shared = @{}
+(Get-Counter '\GPU Process Memory(*)\Shared Usage').CounterSamples | ForEach-Object {
+  if ($_.InstanceName -match '^pid_(\d+)_') { $shared[$matches[1]] = [double]$shared[$matches[1]] + $_.CookedValue } }
+@{ listen = $listen; procs = $procs; gpu = $gpu; shared = $shared } | ConvertTo-Json -Depth 4 -Compress
 """
 
 
@@ -100,7 +109,8 @@ def query_windows(ports) -> dict:
     data = json.loads(out[out.index("{"):])
     as_list = lambda v: v if isinstance(v, list) else ([v] if v else [])  # noqa: E731
     return {"listen": as_list(data.get("listen")), "procs": as_list(data.get("procs")),
-            "gpu": {int(k): v for k, v in (data.get("gpu") or {}).items()}}
+            "gpu": {int(k): v for k, v in (data.get("gpu") or {}).items()},
+            "shared": {int(k): v for k, v in (data.get("shared") or {}).items()}}
 
 
 def nvidia_smi() -> dict | None:
@@ -121,6 +131,23 @@ def http_get(url: str, timeout: float = 3):
     """(status, parsed JSON or None); status None when nothing answered."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
+            body = r.read()
+            try:
+                return r.status, json.loads(body)
+            except ValueError:
+                return r.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, None
+
+
+def http_post_json(url: str, data: dict, timeout: float = 120):
+    """POST a JSON body; (status, parsed JSON or None) like http_get."""
+    req = urllib.request.Request(url, data=json.dumps(data).encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
             try:
                 return r.status, json.loads(body)
@@ -189,7 +216,7 @@ def snapshot(servers: dict) -> dict:
     now, gpu_ok, owned, rows = time.time(), bool(win["gpu"]), set(), {}
     for name, s in servers.items():
         row = {"name": name, "state": "down", "pid": None, "host": None, "vram": None,
-               "uptime_s": None, "busy": None, "other": None}
+               "shared": None, "uptime_s": None, "busy": None, "other": None}
         hosts = s.get("hosts", ["127.0.0.1"])
         mine = [x for x in win["listen"] if x["port"] == s["port"]]
         if mine and not owns(s, procs.get(mine[0]["pid"])):
@@ -220,6 +247,8 @@ def snapshot(servers: dict) -> dict:
             owned.update(pids)
             if gpu_ok:
                 row["vram"] = sum(win["gpu"].get(x, 0) for x in pids)
+                shared = win.get("shared") or {}  # an older query result has no shared counters
+                row["shared"] = sum(shared.get(x, 0) for x in pids)
             if procs.get(row["pid"], {}).get("start"):
                 row["uptime_s"] = int(now - procs[row["pid"]]["start"])
         rows[name] = row
@@ -464,6 +493,74 @@ def cmd_switch(args, servers):
     return 0
 
 
+def measure_speed(s: dict, row: dict) -> tuple[float | None, int | None, str]:
+    """(tok/s, tokens, note) from one short completion on a llama.cpp server; it is never
+    measured while the server is busy or not ready."""
+    if s.get("busy") != "llama-slots":
+        return None, None, "not measured (not a llama.cpp server)"
+    if row["state"] != "up":
+        return None, None, f"not measured ({row['state']})"
+    if row["busy"]:
+        return None, None, "not measured (busy with another request)"
+    code, data = http_post_json(f"http://{row['host']}:{s['port']}/completion", SPEED_REQUEST)
+    timings = data.get("timings") if code == 200 and isinstance(data, dict) else None
+    if not isinstance(timings, dict) or not isinstance(timings.get("predicted_per_second"), (int, float)):
+        return None, None, f"not measured (the request failed: {code or 'no answer'})"
+    return float(timings["predicted_per_second"]), timings.get("predicted_n"), ""
+
+
+def check_result(name: str, s: dict, snap: dict, speed: bool) -> dict:
+    r, card = snap["servers"][name], snap["gpu"]
+    result = {"name": name, "state": r["state"], "running": running(r), "pid": r["pid"],
+              "dedicated_bytes": r["vram"], "shared_bytes": r["shared"],
+              "spilling": r["shared"] is not None and r["shared"] >= SPILL_MIN,
+              "card_free_bytes": card["total"] - card["used"] if card else None,
+              "tok_s": None, "tokens": None, "min_tok_s": s.get("min_tok_s"),
+              "speed_note": "not requested"}
+    if speed and result["running"]:
+        result["tok_s"], result["tokens"], result["speed_note"] = measure_speed(s, r)
+    too_slow = result["tok_s"] is not None and result["min_tok_s"] is not None and result["tok_s"] < result["min_tok_s"]
+    result["too_slow"] = too_slow
+    result["ok"] = r["state"] == "up" and not result["spilling"] and not too_slow
+    return result
+
+
+def cmd_check(args, servers):
+    """Read-only: is this server up, holding its model in dedicated VRAM, and (with --speed)
+    generating as fast as expected? Never stops, starts or switches anything."""
+    s = servers[args.name]
+    snap = snapshot(servers)
+    res = check_result(args.name, s, snap, args.speed)
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res["ok"] else 1
+    r = snap["servers"][args.name]
+    if not res["running"]:
+        print(f"{args.name}: not running ({r['state']})."
+              + (" " + foreign_note(args.name, s, r) if r["state"] == "other install" else ""))
+        return 1
+    memory = f"{gb(res['dedicated_bytes'])} dedicated, {gb(res['shared_bytes'])} shared"
+    if res["spilling"]:
+        print(f"{args.name}: {r['state']} (pid {r['pid']}), {memory} - SPILLING: part of the model is in "
+              f"system RAM, so it runs several times slower. Free VRAM (`gpu.py status` shows what holds it) "
+              f"and restart it.")
+    else:
+        print(f"{args.name}: {r['state']} (pid {r['pid']}), {memory} - "
+              + ("no spill" if res["shared_bytes"] is not None else "spill unknown (no GPU counters)"))
+    g = snap["gpu"]
+    if g:
+        print(f"card: {gb(res['card_free_bytes'])} of {gb(g['total'])} free")
+    if args.speed:
+        if res["tok_s"] is None:
+            print(f"speed: {res['speed_note']}")
+        else:
+            print(f"speed: {res['tok_s']:.1f} tok/s" + (f" ({res['tokens']} tokens)" if res["tokens"] else "")
+                  + (f" - BELOW the expected {res['min_tok_s']} tok/s" if res["too_slow"] else ""))
+    if r["state"] != "up":
+        print(f"{args.name} is not ready yet ({r['state']}).")
+    return 0 if res["ok"] else 1
+
+
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
@@ -478,12 +575,17 @@ def main() -> int:
     p.add_argument("--timeout", type=int, help="seconds to wait for it to be ready (default: per server)")
     p = sub.add_parser("stop", help="stop one server, or all (after confirming)")
     p.add_argument("name", choices=list(servers) + ["all"])
+    p = sub.add_parser("check", help="is it up, in dedicated VRAM (no spill), and fast enough (read-only)")
+    p.add_argument("name", choices=list(servers))
+    p.add_argument("--speed", action="store_true", help="time a 128-token completion (llama.cpp servers)")
+    p.add_argument("--json", action="store_true")
     for p in sub.choices.values():
-        if p.prog.split()[-1] != "status":
+        if p.prog.split()[-1] not in ("status", "check"):
             p.add_argument("--yes", action="store_true", help="the user already confirmed")
             p.add_argument("--force", action="store_true", help="stop a server even while it runs a job")
     args = ap.parse_args()
-    return {"status": cmd_status, "switch": cmd_switch, "stop": cmd_stop}[args.cmd](args, servers) or 0
+    commands = {"status": cmd_status, "switch": cmd_switch, "stop": cmd_stop, "check": cmd_check}
+    return commands[args.cmd](args, servers) or 0
 
 
 if __name__ == "__main__":
