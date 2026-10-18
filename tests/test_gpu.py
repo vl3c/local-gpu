@@ -416,6 +416,16 @@ class CheckTest(unittest.TestCase):
         self.llama_up(shared=(0.9, 0.0))
         self.assertEqual(self.check()[0], 0)
 
+    def test_exactly_one_gb_shared_is_a_spill(self):
+        self.llama_up(shared=(0.75, 0.25))
+        self.assertEqual(self.check()[0], 1)
+
+    def test_a_reply_without_a_token_count(self):
+        self.llama_up()
+        self.m.completion = (200, {"timings": {"predicted_per_second": 50.0}})
+        code, out = self.check(speed=True)
+        self.assertIn("speed: 50.0 tok/s\n", out)
+
     def test_speed_is_measured_on_the_host_that_answered(self):
         self.llama_up(addr="127.0.0.2")
         code, out = self.check(speed=True)

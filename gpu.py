@@ -554,7 +554,7 @@ def cmd_check(args, servers):
         if res["tok_s"] is None:
             print(f"speed: {res['speed_note']}")
         else:
-            print(f"speed: {res['tok_s']:.1f} tok/s ({res['tokens']} tokens)"
+            print(f"speed: {res['tok_s']:.1f} tok/s" + (f" ({res['tokens']} tokens)" if res["tokens"] else "")
                   + (f" - BELOW the expected {res['min_tok_s']} tok/s" if res["too_slow"] else ""))
     if r["state"] != "up":
         print(f"{args.name} is not ready yet ({r['state']}).")
