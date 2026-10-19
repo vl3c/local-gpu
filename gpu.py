@@ -273,7 +273,7 @@ def snapshot(servers: dict) -> dict:
     paged = [{"pid": pid, "name": procs.get(pid, {}).get("name", "?"), "server": server_of.get(pid),
               "evicted": evicted(win, pid)}
              for pid in (win.get("committed") or {})
-             if procs.get(pid, {}).get("name") not in IGNORE and evicted(win, pid) >= SPILL_MIN]
+             if gpu_ok and procs.get(pid, {}).get("name") not in IGNORE and evicted(win, pid) >= SPILL_MIN]
     paged.sort(key=lambda o: -o["evicted"])
     return {"gpu": nvidia_smi(), "gpu_counter_ok": gpu_ok, "servers": rows, "others": others, "paged_out": paged}
 
