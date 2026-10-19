@@ -219,6 +219,7 @@ def snapshot(servers: dict) -> dict:
         return out
 
     now, gpu_ok, owned, rows = time.time(), bool(win["gpu"]), set(), {}
+    server_of: dict[int, str] = {}  # pid -> the registered server whose process tree it is in
     for name, s in servers.items():
         row = {"name": name, "state": "down", "pid": None, "host": None, "vram": None,
                "shared": None, "evicted": None, "uptime_s": None, "busy": None, "other": None}
@@ -250,6 +251,7 @@ def snapshot(servers: dict) -> dict:
         if row["pid"]:
             pids = tree(row["pid"])
             owned.update(pids)
+            server_of.update((x, name) for x in pids)
             if gpu_ok:
                 row["vram"] = sum(win["gpu"].get(x, 0) for x in pids)
                 shared = win.get("shared") or {}  # an older query result has no shared counters
@@ -264,11 +266,13 @@ def snapshot(servers: dict) -> dict:
               for pid, b in win["gpu"].items()
               if b >= OTHER_MIN and pid not in owned and procs.get(pid, {}).get("name") not in IGNORE]
     others.sort(key=lambda o: -o["vram"])
-    # Programs (not this server) with memory evicted from VRAM: the card is oversubscribed, and
-    # whichever of them runs pushes the others' memory out again.
-    paged = [{"pid": pid, "name": procs.get(pid, {}).get("name", "?"), "evicted": evicted(win, pid)}
+    # Processes with memory evicted from VRAM: the card is oversubscribed, and whichever of them
+    # runs pushes the others' memory out again. Registered servers are included (tagged with their
+    # name): another model server is the most likely culprit. `check` leaves out its own server.
+    paged = [{"pid": pid, "name": procs.get(pid, {}).get("name", "?"), "server": server_of.get(pid),
+              "evicted": evicted(win, pid)}
              for pid in (win.get("committed") or {})
-             if pid not in owned and procs.get(pid, {}).get("name") not in IGNORE and evicted(win, pid) >= SPILL_MIN]
+             if procs.get(pid, {}).get("name") not in IGNORE and evicted(win, pid) >= SPILL_MIN]
     paged.sort(key=lambda o: -o["evicted"])
     return {"gpu": nvidia_smi(), "gpu_counter_ok": gpu_ok, "servers": rows, "others": others, "paged_out": paged}
 
@@ -532,7 +536,7 @@ def measure_speed(s: dict, row: dict) -> tuple[float | None, int | None, str]:
 def check_result(name: str, s: dict, snap: dict, speed: bool) -> dict:
     r, card = snap["servers"][name], snap["gpu"]
     out_of_vram = None if r["shared"] is None else r["shared"] + (r.get("evicted") or 0)
-    paged = snap.get("paged_out") or []
+    paged = [p for p in snap.get("paged_out") or [] if p.get("server") != name]
     result = {"name": name, "state": r["state"], "running": running(r), "pid": r["pid"],
               "dedicated_bytes": r["vram"], "shared_bytes": r["shared"], "evicted_bytes": r.get("evicted"),
               "spilling": out_of_vram is not None and out_of_vram >= SPILL_MIN,
@@ -573,7 +577,7 @@ def cmd_check(args, servers):
               + ("no spill" if res["shared_bytes"] is not None else "spill unknown (no GPU counters)"))
     if res["contended"]:
         print("CONTENDED: the card is oversubscribed. These programs have GPU memory paged out to system RAM: "
-              + ", ".join(f"{p['name']} (pid {p['pid']}) {gb(p['evicted'])}" for p in res["paged_out"])
+              + ", ".join(f"{p['server'] or p['name']} (pid {p['pid']}) {gb(p['evicted'])}" for p in res["paged_out"])
               + ". Whenever one of them runs, the others' memory is pushed out and both run several times "
               "slower. Close it, or stop it with gpu.py if it is a registered server.")
     g = snap["gpu"]
