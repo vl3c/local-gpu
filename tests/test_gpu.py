@@ -532,9 +532,42 @@ class CheckTest(unittest.TestCase):
         self.assertEqual((data["contended"], data["spilling"], data["ok"]), (True, False, False))
         self.assertEqual([p["pid"] for p in data["paged_out"]], [70])
 
-    def test_the_servers_own_children_are_not_contention(self):
-        self.llama_up(vram=(1.0, 12.0), committed=(1.2, 12.2))  # 0.1 GB below the 1 GB line
-        self.assertEqual(self.check()[0], 0)
+    def test_the_servers_own_children_are_spill_not_contention(self):
+        self.llama_up(vram=(1.0, 10.0), shared=(0.0, 0.0), committed=(1.0, 12.0))  # its child: 2 GB evicted
+        code, out = self.check(json=True)
+        data = json.loads(out)
+        self.assertEqual((code, data["spilling"], data["contended"], data["paged_out"]), (1, True, False, []))
+
+    def test_another_registered_server_paged_out_is_contention(self):
+        # The case that matters most: two model servers from the registry on one card.
+        self.llama_up(committed=(1.2, 12.1))
+        self.m.listen.append({"addr": "127.0.0.1", "port": 8188, "pid": 60})
+        self.m.proc(60, f"py {self.m.folder('local-image')}\\ComfyUI\\main.py", vram=1.0, committed=10.0)
+        self.m.health[8188] = (200, {})
+        self.m.extra["/queue"] = (200, {"queue_running": [], "queue_pending": []})
+        code, out = self.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("CONTENDED", out)
+        self.assertIn("local-image (pid 60) 9.0 GB", out)
+        data = json.loads(self.check(json=True)[1])
+        self.assertEqual([(p["pid"], p["server"]) for p in data["paged_out"]], [(60, "local-image")])
+        # ...and checked from the other side, local-image sees itself spilling, not contended.
+        image = json.loads(self.check("local-image", json=True)[1])
+        self.assertEqual((image["spilling"], image["contended"]), (True, False))
+
+    def test_a_foreign_copy_is_listed_by_process_not_as_the_server(self):
+        self.llama_up(committed=(1.2, 12.1))
+        self.m.listen.append({"addr": "127.0.0.1", "port": 8188, "pid": 60})  # a worktree copy holds the port
+        self.m.proc(60, f"py {self.m.folder('local-image')}\\.claude\\worktrees\\x\\ComfyUI\\main.py",
+                    vram=1.0, committed=10.0)
+        data = json.loads(self.check(json=True)[1])
+        self.assertEqual([(p["pid"], p["server"]) for p in data["paged_out"]], [(60, None)])
+
+    def test_no_dedicated_counters_means_no_contention_guess(self):
+        self.llama_up(vram=(0, 0), shared=(0, 0), committed=(1.0, 12.0))
+        self.m.proc(70, None, name="other.exe", committed=10.0)
+        data = json.loads(self.check(json=True)[1])
+        self.assertEqual((data["contended"], data["paged_out"]), (False, []))
 
     def test_the_command_is_wired_read_only(self):
         seen, reg = {}, self.m.registry()
