@@ -251,7 +251,8 @@ def snapshot(servers: dict) -> dict:
         if row["pid"]:
             pids = tree(row["pid"])
             owned.update(pids)
-            server_of.update((x, name) for x in pids)
+            if row["state"] != "other install":  # a foreign copy is not this server (gpu.py won't stop it)
+                server_of.update((x, name) for x in pids)
             if gpu_ok:
                 row["vram"] = sum(win["gpu"].get(x, 0) for x in pids)
                 shared = win.get("shared") or {}  # an older query result has no shared counters
